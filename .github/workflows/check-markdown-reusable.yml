@@ -5,6 +5,10 @@
 
 name: Check Markdown Fences (Reusable)
 
+# The checkout token only needs to read the calling repository.
+permissions:
+  contents: read
+
 on:
   workflow_call:
     inputs:
@@ -98,9 +102,14 @@ jobs:
           def main():
               parser = argparse.ArgumentParser(description='Validate Pandoc fenced-div balance in Markdown files')
               parser.add_argument('files', nargs='*', help='Files to check')
+              parser.add_argument('--from-nul-list', metavar='FILE',
+                                  help='Read NUL-separated paths from FILE (safe for any filename)')
               args = parser.parse_args()
               
-              files = args.files
+              files = list(args.files)
+              if args.from_nul_list:
+                  with open(args.from_nul_list, 'rb') as f:
+                      files.extend(p.decode('utf-8') for p in f.read().split(b'\0') if p)
               
               if not files:
                   print("No files to check.")
@@ -150,36 +159,55 @@ jobs:
 
       - name: Find changed Markdown files
         id: changed-files
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          set -euo pipefail
+          LIST=.pandoc_template/changed_md.lst
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE_SHA="$PR_BASE_SHA"
           else
-            # For push events, use the before SHA
-            BASE_SHA="${{ github.event.before }}"
-            # Handle initial commit (0000000...)
-            if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
-              BASE_SHA="HEAD^"
-            fi
+            BASE_SHA="$BEFORE_SHA"
           fi
-          
-          FILES=$(git diff --name-only --diff-filter=ACM $BASE_SHA ${{ github.sha }} | grep '\.md$' || true)
-          
-          if [ -z "$FILES" ]; then
-            echo "No Markdown files changed"
-            echo "files=" >> $GITHUB_OUTPUT
-            echo "has_files=false" >> $GITHUB_OUTPUT
+
+          # The checkout is shallow (fetch-depth 2), so the base of a
+          # multi-commit push or a PR is usually not present. Fetch it by SHA;
+          # if that fails, or this is the first push (all-zero "before" SHA),
+          # check every tracked Markdown file instead of silently passing.
+          # The old "HEAD^ || true" version reported success on an initial
+          # commit without checking anything.
+          if [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ] \
+             && ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null || true
+          fi
+          if [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            git diff -z --name-only --diff-filter=ACM "$BASE_SHA" "$HEAD_SHA" -- '*.md' > "$LIST"
           else
-            FILES_SPACE=$(echo "$FILES" | tr '\n' ' ')
-            echo "files=$FILES_SPACE" >> $GITHUB_OUTPUT
-            echo "has_files=true" >> $GITHUB_OUTPUT
-            echo "Changed Markdown files:"
-            echo "$FILES"
+            echo "No usable base commit; checking every tracked Markdown file."
+            git ls-files -z -- '*.md' > "$LIST"
+          fi
+
+          # NUL-delimited so a filename with spaces or shell metacharacters is
+          # never split or interpreted; the validator reads the list directly.
+          COUNT=$(tr -cd '\0' < "$LIST" | wc -c)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No Markdown files changed"
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+            echo "Markdown files to check ($COUNT):"
+            tr '\0' '\n' < "$LIST"
           fi
 
       - name: Validate fence balance
         if: steps.changed-files.outputs.has_files == 'true'
         run: |
-          python .pandoc_template/scripts/validate_fences.py ${{ steps.changed-files.outputs.files }}
+          python .pandoc_template/scripts/validate_fences.py --from-nul-list .pandoc_template/changed_md.lst
 
       - name: Report success
         if: steps.changed-files.outputs.has_files == 'false'
