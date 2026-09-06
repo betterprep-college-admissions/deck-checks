@@ -1,0 +1,187 @@
+# Reusable workflow for checking Markdown fence balance across content repos
+# Called by content repos like math_grade_1, python_intro, etc.
+# 
+# This is the single source of truth - update here and all repos benefit
+
+name: Check Markdown Fences (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      slides-path:
+        description: 'Path to slides directory'
+        required: false
+        type: string
+        default: 'slides'
+
+jobs:
+  check-fences:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          fetch-depth: 2  # Only need enough history for comparison, not full history
+
+      - name: Create validation script
+        run: |
+          mkdir -p .pandoc_template/scripts
+          cat << 'PY_SCRIPT_EOF' > .pandoc_template/scripts/validate_fences.py
+          #!/usr/bin/env python3
+          """
+          Validate that all Pandoc fenced divs in Markdown files are properly balanced.
+          
+          Pandoc permits any run of three or more colons. A tagged run opens a
+          div and a colon-only run closes the most recent div, regardless of
+          delimiter width.
+          """
+          
+          import sys
+          import os
+          import subprocess
+          import argparse
+          import re
+          from pathlib import Path
+
+
+          OPEN = re.compile(r'^:{3,}\s*(?:\{.*\}|[A-Za-z][\w-]*)\s*$')
+          CLOSE = re.compile(r'^:{3,}\s*$')
+          HTML_COMMENT = re.compile(r'<!--.*?-->', re.DOTALL)
+
+
+          def visible_source(text: str) -> str:
+              """Remove HTML comments while preserving their newline count."""
+              return HTML_COMMENT.sub(
+                  lambda match: '\n' * match.group(0).count('\n'), text
+              )
+          
+          
+          def validate_fence_structure(filepath: str) -> list[str]:
+              """
+              Validate the structure of :::: fence blocks in a markdown file.
+              
+              Returns a list of issues found, empty if file is valid.
+              """
+              try:
+                  with open(filepath, 'r', encoding='utf-8') as f:
+                      lines = visible_source(f.read()).splitlines()
+              except Exception as e:
+                  return [f"Could not read file: {e}"]
+              
+              stack = []
+              issues = []
+              
+              for i, line in enumerate(lines, 1):
+                  if OPEN.match(line):
+                      stack.append((i, line.strip()))
+                  elif CLOSE.match(line):
+                      # Pandoc closes the most recently opened fenced div. The
+                      # closer width need not match the opener, and three-colon
+                      # divs participate in the same stack.
+                      if stack:
+                          stack.pop()
+                      else:
+                          issues.append(
+                              f"Line {i}: Orphaned closing {line.strip()} "
+                              "(no matching opening tag)"
+                          )
+              
+              # Check for unclosed blocks
+              for line_num, opener in stack:
+                  issues.append(f"Line {line_num}: Unclosed {opener} block")
+              
+              return issues
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(description='Validate Pandoc fenced-div balance in Markdown files')
+              parser.add_argument('files', nargs='*', help='Files to check')
+              args = parser.parse_args()
+              
+              files = args.files
+              
+              if not files:
+                  print("No files to check.")
+                  sys.exit(0)
+              
+              # Validate each file
+              total_issues = 0
+              files_with_issues = 0
+              
+              for filepath in files:
+                  if not os.path.exists(filepath):
+                      print(f"⚠️  File not found: {filepath}")
+                      continue
+                      
+                  issues = validate_fence_structure(filepath)
+                  
+                  if issues:
+                      files_with_issues += 1
+                      total_issues += len(issues)
+                      print(f"\n❌ {filepath}")
+                      for issue in issues:
+                          print(f"   {issue}")
+                  else:
+                      print(f"✅ {filepath}")
+              
+              # Summary
+              print(f"\n{'=' * 50}")
+              print(f"Files with issues: {files_with_issues}")
+              print(f"Total issues: {total_issues}")
+              
+              if total_issues > 0:
+                  print("\n⚠️  Some files have unbalanced :::: fences!")
+                  sys.exit(1)
+              else:
+                  print("\n✅ All files have balanced :::: fences!")
+                  sys.exit(0)
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY_SCRIPT_EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Find changed Markdown files
+        id: changed-files
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          else
+            # For push events, use the before SHA
+            BASE_SHA="${{ github.event.before }}"
+            # Handle initial commit (0000000...)
+            if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+              BASE_SHA="HEAD^"
+            fi
+          fi
+          
+          FILES=$(git diff --name-only --diff-filter=ACM $BASE_SHA ${{ github.sha }} | grep '\.md$' || true)
+          
+          if [ -z "$FILES" ]; then
+            echo "No Markdown files changed"
+            echo "files=" >> $GITHUB_OUTPUT
+            echo "has_files=false" >> $GITHUB_OUTPUT
+          else
+            FILES_SPACE=$(echo "$FILES" | tr '\n' ' ')
+            echo "files=$FILES_SPACE" >> $GITHUB_OUTPUT
+            echo "has_files=true" >> $GITHUB_OUTPUT
+            echo "Changed Markdown files:"
+            echo "$FILES"
+          fi
+
+      - name: Validate fence balance
+        if: steps.changed-files.outputs.has_files == 'true'
+        run: |
+          python .pandoc_template/scripts/validate_fences.py ${{ steps.changed-files.outputs.files }}
+
+      - name: Report success
+        if: steps.changed-files.outputs.has_files == 'false'
+        run: |
+          echo "✅ No Markdown files changed, skipping validation"
